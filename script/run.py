@@ -1,14 +1,16 @@
 """
-run.py – Generates MP4 animations for three experimental conditions:
-  1. social_learning  : social_learning_weight=1, conformity_weight=0 (default)
-  2. control          : social_learning_weight=0 (default), conformity_weight=0 (default)
-  3. conformity       : conformity_weight=1, social_learning_weight=0 (default)
+run.py – Generates static PDF figures for three conditions × two p_GM values.
 
-For each condition four animations are saved:
-  {condition}_action_grid.mp4
-  {condition}_belief_grid.mp4
-  {condition}_cultivation_plot.mp4
-  {condition}_belief_plot.mp4
+Conditions:
+  asocial        : social_learning_weight=0, conformity_weight=0
+  social_learning: social_learning_weight=1, conformity_weight=0
+  conformity     : social_learning_weight=0, conformity_weight=1
+
+Growth proportions: 0.2 (GM as minority) and 0.8 (GM as majority)
+
+Output structure:
+  output/{figure_type}/pGM{pGM_value}/{condition}.pdf
+  output/fig_{figure_type}.pdf   <- composite (row1=low pGM, row2=high pGM)
 """
 
 import os
@@ -17,11 +19,9 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
 from matplotlib.patches import Patch
-from matplotlib.lines import Line2D
+import matplotlib.colors as mcolors
 
-# ── ensure local modules resolve ──────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 from model import MindsetModel
 
@@ -30,7 +30,6 @@ DEFAULT_PARAMS = dict(
     width=50, height=50,
     reward_slope=1.0, reward_intercept=10.0,
     time_horizon=50, malleability=0.5,
-    growth_proportion=0.7,
     growth_prior_mean=0.8, growth_prior_strength=20,
     social_learning_weight=0.0,
     conformity_weight=0.0,
@@ -38,40 +37,33 @@ DEFAULT_PARAMS = dict(
 )
 
 CONDITIONS = {
+    "asocial":         {},
     "social_learning": {"social_learning_weight": 1.0},
-    "control":         {},
     "conformity":      {"conformity_weight": 1.0},
+    "both_social":     {"social_learning_weight": 0.5, "conformity_weight": 0.5},
 }
 
-OUTPUT_DIR = "outputs"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+CONDITION_LABELS = {
+    "asocial":         "Asocial",
+    "social_learning": "Social Learning",
+    "conformity":      "Conformity",
+    "both_social":     "Social Learning + Conformity",
+}
 
-FPS = 10
-DPI = 100
+GM_PROPORTIONS = [0.2, 0.8]
+SNAPSHOT_STEP  = 10
 
+COLOR_GROWTH    = "#2E6DA4"
+COLOR_FIXED     = "#C0392B"
+COLOR_CULTIVATE = "#222222"
+COLOR_HARVEST   = "#bEbEbE"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_model(params: dict) -> MindsetModel:
-    """Run the model to completion and return it (with datacollector populated)."""
-    m = MindsetModel(**params)
-    while m.running:
-        m.step()
-    return m
-
-
-def _agent_grid(model, attr_fn):
-    """Return a (height x width) array of per-agent values."""
-    grid = np.full((model.grid.height, model.grid.width), np.nan)
-    for agent in model.agents:
-        x, y = agent.pos
-        grid[y, x] = attr_fn(agent)
-    return grid
+DPI = 150
 
 
-def _optimal_switch(model) -> int:
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _optimal_switch(model):
     D = model.time_horizon
     w = model.reward_slope
     R = model.reward_intercept
@@ -80,179 +72,197 @@ def _optimal_switch(model) -> int:
     return int(np.clip(round(d_tilde), 0, D))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# per-frame data builders
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_frame_data(params: dict):
-    """
-    Run the model step-by-step, capturing per-frame state.
-    Returns a list of dicts (one per step).
-    """
+def run_model_with_snapshots(params, snapshot_step):
     m = MindsetModel(**params)
-    frames = []
+    snap_action = snap_belief = None
     while m.running:
         m.step()
-        # snapshot agent states
-        action_arr = _agent_grid(
-            m, lambda a: 1 if (a.choice_history and a.choice_history[-1] == 'cultivate') else 0)
-        belief_arr = _agent_grid(m, lambda a: a.malleability_estimate)
-        df = m.datacollector.get_model_vars_dataframe()
-        frames.append(dict(
-            step=m.time_step,
-            action_arr=action_arr.copy(),
-            belief_arr=belief_arr.copy(),
-            df=df.copy(),
-        ))
-    return frames, m
+        if m.time_step == snapshot_step:
+            W, H = m.grid.width, m.grid.height
+            action_arr = np.full((H, W), np.nan)
+            belief_arr = np.full((H, W), np.nan)
+            for agent in m.agents:
+                x, y = agent.pos
+                action_arr[y, x] = (
+                    1 if (agent.choice_history and agent.choice_history[-1] == 'cultivate')
+                    else 0
+                )
+                belief_arr[y, x] = agent.malleability_estimate
+            snap_action = action_arr.copy()
+            snap_belief = belief_arr.copy()
+    df = m.datacollector.get_model_vars_dataframe()
+    return m, df, snap_action, snap_belief
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# animation builders
-# ─────────────────────────────────────────────────────────────────────────────
+# ── per-panel plotters ────────────────────────────────────────────────────────
 
-def make_action_grid_anim(frames, model, path):
-    fig, ax = plt.subplots(figsize=(5, 5), dpi=DPI)
-    im = ax.imshow(frames[0]["action_arr"], vmin=0, vmax=1,
-                   cmap=plt.cm.colors.ListedColormap(["#bEbEbE", "#222222"]),
-                   origin="lower", interpolation="nearest")
-    ax.set_xticks([]); ax.set_yticks([])
-    legend_elems = [Patch(facecolor="#222222", label="Cultivate"),
-                    Patch(facecolor="#bEbEbE", label="Harvest")]
-    ax.legend(handles=legend_elems, loc="upper right", fontsize=8)
-    title = ax.set_title("Step 0", fontsize=10)
-
-    def update(i):
-        im.set_data(frames[i]["action_arr"])
-        title.set_text(f"Step {frames[i]['step']}")
-        return [im, title]
-
-    ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=1000//FPS, blit=True)
-    ani.save(path, writer="ffmpeg", fps=FPS)
-    plt.close(fig)
-    print(f"  saved {path}")
-
-
-def make_belief_grid_anim(frames, model, path):
-    fig, ax = plt.subplots(figsize=(5, 5), dpi=DPI)
-    im = ax.imshow(frames[0]["belief_arr"], vmin=0, vmax=1,
-                   cmap="RdBu", origin="lower", interpolation="nearest")
-    ax.set_xticks([]); ax.set_yticks([])
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Malleability estimate", fontsize=8)
-    title = ax.set_title("Step 0", fontsize=10)
-
-    def update(i):
-        im.set_data(frames[i]["belief_arr"])
-        title.set_text(f"Step {frames[i]['step']}")
-        return [im, title]
-
-    ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=1000//FPS, blit=False)
-    ani.save(path, writer="ffmpeg", fps=FPS)
-    plt.close(fig)
-    print(f"  saved {path}")
-
-
-def make_cultivation_plot_anim(frames, model, path):
-    D = model.time_horizon
+def plot_action_trajectory(ax, df, model, title, show_ylabel=True, show_xlabel=True):
     switch = _optimal_switch(model)
-
-    fig, ax = plt.subplots(figsize=(5.4, 4), dpi=DPI)
-    fig.subplots_adjust(left=0.16, right=0.96, bottom=0.16, top=0.94)
+    D = model.time_horizon
+    steps = df.index + 1
     if switch > 0:
-        ax.axvspan(0, switch, color="#e6e6e6", alpha=0.5, zorder=0)
+        ax.axvspan(0, switch, color="#e6e6e6", alpha=0.6, zorder=0)
     ax.axhline(model.growth_proportion, color="#6B6B6B", linestyle="--", linewidth=1)
-    ax.set_xlim(0, D); ax.set_ylim(0, 1)
-    ax.set_xlabel("Step"); ax.set_ylabel("Cultivate proportion")
-    line, = ax.plot([], [], color="#222222", linewidth=3, zorder=2)
-    title = ax.set_title("Step 0", fontsize=10)
-
-    def update(i):
-        df = frames[i]["df"]
-        steps = df.index + 1
-        line.set_data(steps, df["cultivate_proportion"])
-        title.set_text(f"Step {frames[i]['step']}")
-        return [line, title]
-
-    ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=1000//FPS, blit=True)
-    ani.save(path, writer="ffmpeg", fps=FPS)
-    plt.close(fig)
-    print(f"  saved {path}")
+    ax.plot(steps, df["cultivate_proportion"], color=COLOR_CULTIVATE, linewidth=2.5, zorder=2)
+    ax.set_xlim(0, D)
+    ax.set_ylim(0, 1)
+    if show_xlabel:
+        ax.set_xlabel("Step", fontsize=9)
+    if show_ylabel:
+        ax.set_ylabel("Cultivate proportion", fontsize=9)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.tick_params(labelsize=8)
 
 
-def make_belief_plot_anim(frames, model, path):
-    D = model.time_horizon
+def plot_belief_trajectory(ax, df, model, title, show_ylabel=True, show_xlabel=True):
     switch = _optimal_switch(model)
-
-    fig, ax = plt.subplots(figsize=(5.4, 4), dpi=DPI)
-    fig.subplots_adjust(left=0.16, right=0.96, bottom=0.16, top=0.94)
+    D = model.time_horizon
+    steps = df.index + 1
     if switch > 0:
-        ax.axvspan(0, switch, color="#e6e6e6", alpha=0.5, zorder=0)
+        ax.axvspan(0, switch, color="#e6e6e6", alpha=0.6, zorder=0)
     ax.axhline(model.malleability, color="#6B6B6B", linestyle="--", linewidth=1)
-    ax.set_xlim(0, D); ax.set_ylim(0, 1)
-    ax.set_xlabel("Step"); ax.set_ylabel("Malleability estimate")
-
-    COLORS = {"growth": "#2E6DA4", "fixed": "#C0392B"}
-    lines = {}
-    fills = {}
-    for mindset, color in COLORS.items():
-        lines[mindset], = ax.plot([], [], color=color, linewidth=3, label=f"{mindset} mindset", zorder=2)
-        fills[mindset] = ax.fill_between([], [], [], color=color, alpha=0.15, zorder=1)
-    ax.legend(fontsize=8)
-    title = ax.set_title("Step 0", fontsize=10)
-
-    def update(i):
-        df = frames[i]["df"]
-        steps = df.index + 1
-        artists = [title]
-        for mindset in COLORS:
-            mean = df[f"{mindset}_belief_mean"]
-            std  = df[f"{mindset}_belief_std"]
-            lines[mindset].set_data(steps, mean)
-            # re-draw fill_between by replacing collection
-            fills[mindset].remove()
-            fills[mindset] = ax.fill_between(
-                steps, mean - std, mean + std, color=COLORS[mindset], alpha=0.15, zorder=1)
-            artists.append(lines[mindset])
-        title.set_text(f"Step {frames[i]['step']}")
-        return artists
-
-    ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=1000//FPS, blit=False)
-    ani.save(path, writer="ffmpeg", fps=FPS)
-    plt.close(fig)
-    print(f"  saved {path}")
+    for mindset, color in [("growth", COLOR_GROWTH), ("fixed", COLOR_FIXED)]:
+        mean = df[f"{mindset}_belief_mean"]
+        std  = df[f"{mindset}_belief_std"]
+        ax.plot(steps, mean, color=color, linewidth=2.5, label=f"{mindset}", zorder=2)
+        ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.15, zorder=1)
+    ax.set_xlim(0, D)
+    ax.set_ylim(0, 1)
+    if show_xlabel:
+        ax.set_xlabel("Step", fontsize=9)
+    if show_ylabel:
+        ax.set_ylabel("Malleability estimate", fontsize=9)
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.legend(fontsize=7, loc="upper right")
+    ax.tick_params(labelsize=8)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# main
-# ─────────────────────────────────────────────────────────────────────────────
+def plot_action_grid(ax, snap, title):
+    cmap = mcolors.ListedColormap([COLOR_HARVEST, COLOR_CULTIVATE])
+    ax.imshow(snap, vmin=0, vmax=1, cmap=cmap, origin="lower", interpolation="nearest")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    legend_elems = [
+        Patch(facecolor=COLOR_CULTIVATE, label="Cultivate"),
+        Patch(facecolor=COLOR_HARVEST,   label="Harvest"),
+    ]
+    ax.legend(handles=legend_elems, loc="upper right", fontsize=7)
+
+
+def plot_belief_grid(ax, snap, model, title):
+    im = ax.imshow(snap, vmin=0, vmax=1, cmap="RdBu", origin="lower", interpolation="nearest")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=7)
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    for cond_name, overrides in CONDITIONS.items():
-        params = {**DEFAULT_PARAMS, **overrides}
-        print(f"\n{'='*60}")
-        print(f"Condition: {cond_name}  |  overrides: {overrides or '(none)'}")
-        print(f"{'='*60}")
+    cond_list = list(CONDITIONS.keys())
 
-        print("  Running simulation …")
-        frames, model = build_frame_data(params)
-        print(f"  Completed {len(frames)} steps.")
+    # create output dirs
+    os.makedirs("../output", exist_ok=True)
+    for fig_type in ["action_trajectory", "belief_trajectory", "action_grid", "belief_grid"]:
+        for pgm in GM_PROPORTIONS:
+            os.makedirs(f"../output/{fig_type}/pGM{pgm}", exist_ok=True)
 
-        base = os.path.join(OUTPUT_DIR, cond_name)
+    # run all conditions x proportions
+    results = {}  # key: (pgm, cond)
+    for pgm in GM_PROPORTIONS:
+        for cond, overrides in CONDITIONS.items():
+            params = {**DEFAULT_PARAMS, "growth_proportion": pgm, **overrides}
+            print(f"Running pGM={pgm}, condition={cond} ...")
+            m, df, snap_action, snap_belief = run_model_with_snapshots(params, SNAPSHOT_STEP)
+            results[(pgm, cond)] = dict(model=m, df=df,
+                                        snap_action=snap_action,
+                                        snap_belief=snap_belief)
 
-        print("  Rendering action grid …")
-        make_action_grid_anim(frames, model, f"{base}_action_grid.mp4")
+    # ── individual PDFs ───────────────────────────────────────────────────────
+    for pgm in GM_PROPORTIONS:
+        for cond in cond_list:
+            res = results[(pgm, cond)]
+            m, df = res["model"], res["df"]
+            label = CONDITION_LABELS[cond]
 
-        print("  Rendering belief grid …")
-        make_belief_grid_anim(frames, model, f"{base}_belief_grid.mp4")
+            fig, ax = plt.subplots(figsize=(4, 3), dpi=DPI)
+            plot_action_trajectory(ax, df, m, label)
+            fig.tight_layout()
+            fig.savefig(f"../output/action_trajectory/pGM{pgm}/{cond}.pdf", dpi=DPI)
+            plt.close(fig)
 
-        print("  Rendering cultivation plot …")
-        make_cultivation_plot_anim(frames, model, f"{base}_cultivation_plot.mp4")
+            fig, ax = plt.subplots(figsize=(4, 3), dpi=DPI)
+            plot_belief_trajectory(ax, df, m, label)
+            fig.tight_layout()
+            fig.savefig(f"../output/belief_trajectory/pGM{pgm}/{cond}.pdf", dpi=DPI)
+            plt.close(fig)
 
-        print("  Rendering belief plot …")
-        make_belief_plot_anim(frames, model, f"{base}_belief_plot.mp4")
+            fig, ax = plt.subplots(figsize=(4, 4), dpi=DPI)
+            plot_action_grid(ax, res["snap_action"], label)
+            fig.tight_layout()
+            fig.savefig(f"../output/action_grid/pGM{pgm}/{cond}.pdf", dpi=DPI)
+            plt.close(fig)
 
-    print("\nAll done! Files written to:", os.path.abspath(OUTPUT_DIR))
+            fig, ax = plt.subplots(figsize=(4, 4), dpi=DPI)
+            plot_belief_grid(ax, res["snap_belief"], m, label)
+            fig.tight_layout()
+            fig.savefig(f"../output/belief_grid/pGM{pgm}/{cond}.pdf", dpi=DPI)
+            plt.close(fig)
+
+    print("Individual PDFs saved.")
+
+    # ── composite figures: 2 rows x 3 cols ───────────────────────────────────
+    row_labels = {
+        0.2: r"$p_{\mathrm{GM}}=0.2$" + "\n(GM as minority)",
+        0.8: r"$p_{\mathrm{GM}}=0.8$" + "\n(GM as majority)",
+    }
+
+    specs = [
+        ("action_trajectory", plot_action_trajectory, (17, 6.5)),
+        ("belief_trajectory", plot_belief_trajectory, (17, 6.5)),
+        ("action_grid",       None,                   (17, 9.0)),
+        ("belief_grid",       None,                   (17, 9.0)),
+    ]
+
+    for fig_type, _, figsize in specs:
+        fig, axes = plt.subplots(2, 4, figsize=figsize, dpi=DPI)
+
+        for row_i, pgm in enumerate(GM_PROPORTIONS):
+            for col_i, cond in enumerate(cond_list):
+                ax = axes[row_i, col_i]
+                res = results[(pgm, cond)]
+                title = CONDITION_LABELS[cond]
+                show_ylabel = (col_i == 0)
+                show_xlabel = (row_i == 1)
+
+                if fig_type == "action_trajectory":
+                    plot_action_trajectory(ax, res["df"], res["model"], title,
+                                           show_ylabel=show_ylabel, show_xlabel=show_xlabel)
+                elif fig_type == "belief_trajectory":
+                    plot_belief_trajectory(ax, res["df"], res["model"], title,
+                                           show_ylabel=show_ylabel, show_xlabel=show_xlabel)
+                elif fig_type == "action_grid":
+                    plot_action_grid(ax, res["snap_action"], title)
+                elif fig_type == "belief_grid":
+                    plot_belief_grid(ax, res["snap_belief"], res["model"], title)
+
+                # row annotation on leftmost panel
+                if col_i == 0:
+                    base_ylabel = ax.get_ylabel()
+                    new_label = row_labels[pgm]
+                    if base_ylabel:
+                        new_label = base_ylabel + "\n" + new_label
+                    ax.set_ylabel(new_label, fontsize=9)
+
+        fig.tight_layout()
+        out_path = f"../output/fig_{fig_type}.pdf"
+        fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Composite saved: {out_path}")
+
+    print("All done. Output in:", os.path.abspath("../output/"))
 
 
 if __name__ == "__main__":
